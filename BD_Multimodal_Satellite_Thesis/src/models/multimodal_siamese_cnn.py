@@ -1,0 +1,3 @@
+"""Multimodal siamese CNN."""
+
+pass

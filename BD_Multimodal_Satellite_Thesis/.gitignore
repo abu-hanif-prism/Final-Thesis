@@ -1,0 +1,54 @@
+# Python/cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local/generated project artifacts
+data/
+outputs/
+checkpoints/
+logs/
+runs/
+wandb/
+mlruns/
+
+# Model and array artifacts
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.pkl
+*.joblib
+*.npy
+*.npz
+
+# Geospatial/raster outputs and large tabular exports
+*.tif
+*.tiff
+*.vrt
+*.h5
+*.hdf5
+*.nc
+*.parquet
+*.feather
+
+# Archives/downloads
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+
+# Local environment files
+.env
+.env.*

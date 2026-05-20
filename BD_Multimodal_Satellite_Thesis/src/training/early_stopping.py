@@ -1,0 +1,3 @@
+"""Early stopping logic."""
+
+pass

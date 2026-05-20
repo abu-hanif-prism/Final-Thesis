@@ -1,0 +1,39 @@
+years:
+  start: 2016
+  end: 2025
+
+seasons:
+  - Winter
+  - PreMonsoon
+  - Monsoon
+  - PostMonsoon
+
+season_order:
+  Winter: 0
+  PreMonsoon: 1
+  Monsoon: 2
+  PostMonsoon: 3
+
+image_channels: 13
+
+band_names:
+  - Blue
+  - Green
+  - Red
+  - NIR
+  - SWIR1
+  - SWIR2
+  - NDVI
+  - NDWI
+  - MNDWI
+  - NDBI
+  - NDMI
+  - BSI
+  - EVI
+
+target_column: change_ratio
+
+expected_patch_shape:
+  - 13
+  - 128
+  - 128

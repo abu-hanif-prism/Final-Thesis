@@ -1,0 +1,18 @@
+patch_size: 128
+
+stride: 64
+
+min_valid_pixel_ratio: 0.80
+
+change_class_thresholds:
+  low:
+    - 0.00
+    - 0.05
+
+  medium:
+    - 0.05
+    - 0.20
+
+  high:
+    - 0.20
+    - 1.00

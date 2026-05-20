@@ -1,0 +1,3 @@
+"""ConvNeXt multimodal model."""
+
+pass

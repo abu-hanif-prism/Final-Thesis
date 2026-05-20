@@ -1,0 +1,30 @@
+pair_types:
+  - same_season_multiyear
+  - cross_season_sameyear
+  - cross_season_multiyear
+
+time_gap_groups:
+  short:
+    - 1
+
+  medium:
+    - 2
+    - 3
+
+  long:
+    - 4
+    - 5
+    - 6
+
+  very_long:
+    - 7
+    - 8
+    - 9
+
+max_image_use_global: 3
+
+max_image_use_per_epoch: 3
+
+same_season_ratio: 0.6
+
+cross_season_ratio: 0.4

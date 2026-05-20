@@ -1,0 +1,23 @@
+saved_patch_storage:
+  enabled: true
+
+  format: npz
+
+  compression: false
+
+  drives:
+    - "D:/saved_patches_01"
+
+  max_drive_usage_percent: 90
+
+  folder_template: "{split}/{district}"
+
+  image_dtype: float16
+
+  tabular_dtype: float32
+
+  label_dtype: float32
+
+  max_patches_per_pair: 200
+
+  max_patches_per_district: 50000

@@ -1,0 +1,5 @@
+# Add project Python dependencies here
+numpy
+pandas
+rasterio
+torch
