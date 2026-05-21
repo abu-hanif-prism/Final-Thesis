@@ -9,11 +9,13 @@ from src.utils.file_utils import ensure_dir
 
 
 VALID_CHANGE_CLASSES = {"low", "medium", "high"}
-CLASS_TARGETS = {
-    "low": 0.20,
-    "medium": 0.35,
-    "high": 0.45,
+CLASS_ORDER = ["low", "medium", "high"]
+PAIR_CAPS_BY_CLASS = {
+    "low": 50,
+    "medium": 40,
+    "high": 20,
 }
+HIGH_TO_LOW_MEDIUM_RATIO = 1.30
 
 
 def load_valid_labeled_patches(df: pd.DataFrame) -> pd.DataFrame:
@@ -23,12 +25,44 @@ def load_valid_labeled_patches(df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Labeled patch DataFrame is missing columns: {missing}")
 
+    change_ratio = pd.to_numeric(df["change_ratio"], errors="coerce")
     valid = df[
         (df["label_status"] == "success")
-        & df["change_ratio"].notna()
+        & change_ratio.notna()
+        & (change_ratio.abs() != float("inf"))
         & df["change_class"].isin(VALID_CHANGE_CLASSES)
     ].copy()
+    valid["change_ratio"] = change_ratio.loc[valid.index]
     return valid.reset_index(drop=True)
+
+
+def summarize_success_label_filter(df: pd.DataFrame) -> pd.DataFrame:
+    """Report true successful label distribution before final selection."""
+    change_ratio = pd.to_numeric(df["change_ratio"], errors="coerce")
+    success_mask = df["label_status"] == "success"
+    finite_ratio_mask = change_ratio.notna() & (change_ratio.abs() != float("inf"))
+    valid_class_mask = df["change_class"].isin(VALID_CHANGE_CLASSES)
+    valid_mask = success_mask & finite_ratio_mask & valid_class_mask
+
+    rows: list[dict[str, Any]] = [
+        {"metric": "total_input_rows", "value": int(len(df))},
+        {"metric": "success_rows", "value": int(success_mask.sum())},
+        {
+            "metric": "invalid_low_valid_ratio_rows",
+            "value": int((df["label_status"] == "invalid_low_valid_ratio").sum()),
+        },
+        {"metric": "failed_rows", "value": int((df["label_status"] == "failed").sum())},
+        {"metric": "valid_successful_rows", "value": int(valid_mask.sum())},
+    ]
+    valid = df[valid_mask].copy()
+    for change_class in CLASS_ORDER:
+        rows.append(
+            {
+                "metric": f"true_successful_{change_class}_count",
+                "value": int((valid["change_class"] == change_class).sum()),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def summarize_label_distribution(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
@@ -71,30 +105,53 @@ def balanced_class_sampling(
     target_total: int,
     random_seed: int = 42,
 ) -> pd.DataFrame:
-    """Sample one split toward low/medium/high targets without oversampling."""
+    """Select one split with low/medium preserved and high capped aggressively."""
     split_df = df[df["split"] == split_name].copy()
     if split_df.empty:
         return split_df
 
-    effective_total = min(int(target_total), len(split_df))
-    sampled_tables = []
-    for change_class in ["low", "medium", "high"]:
-        class_df = split_df[split_df["change_class"] == change_class].copy()
-        if class_df.empty:
-            continue
-        class_target = int(round(effective_total * CLASS_TARGETS[change_class]))
-        class_target = max(1, class_target)
-        sample_count = min(len(class_df), class_target)
-        sampled = class_df.sample(
-            n=sample_count,
-            random_state=_stable_seed(f"{split_name}_{change_class}", random_seed),
-        )
-        sampled["selection_stage"] = f"class_balanced_{change_class}"
-        sampled["class_sampling_weight"] = (
-            1.0 if sample_count == len(class_df) else sample_count / len(class_df)
-        )
-        sampled_tables.append(sampled)
+    low = _select_class_with_pair_cap(
+        split_df,
+        "low",
+        split_name,
+        PAIR_CAPS_BY_CLASS["low"],
+        random_seed,
+    )
+    medium = _select_class_with_pair_cap(
+        split_df,
+        "medium",
+        split_name,
+        PAIR_CAPS_BY_CLASS["medium"],
+        random_seed,
+    )
+    low_medium_total = len(low) + len(medium)
+    high_target = int(round(low_medium_total * HIGH_TO_LOW_MEDIUM_RATIO))
+    remaining_target = max(0, int(target_total) - low_medium_total)
+    if remaining_target:
+        high_target = min(high_target, remaining_target)
 
+    high = _select_class_with_pair_cap(
+        split_df,
+        "high",
+        split_name,
+        PAIR_CAPS_BY_CLASS["high"],
+        random_seed,
+    )
+    high = _enforce_high_district_soft_cap(
+        high,
+        split_name=split_name,
+        target_count=high_target,
+        random_seed=random_seed,
+    )
+    if len(high) > high_target:
+        high = _spatial_sample_group(
+            high,
+            max_patches=high_target,
+            random_seed=_stable_seed(f"{split_name}_high_target", random_seed),
+        )
+        high["selection_stage"] = high["selection_stage"].astype(str) + "|high_target_cap"
+
+    sampled_tables = [table for table in [low, medium, high] if not table.empty]
     if not sampled_tables:
         return split_df.iloc[0:0].copy()
     return pd.concat(sampled_tables, ignore_index=True)
@@ -170,8 +227,6 @@ def create_final_patch_selection(
     split_tables = []
     for split_name, target_total in split_targets.items():
         sampled = balanced_class_sampling(valid, split_name, target_total, random_seed)
-        sampled = enforce_pair_diversity(sampled, max_patches_per_pair=30, random_seed=random_seed)
-        sampled = enforce_district_diversity(sampled, max_patches_per_district=None, random_seed=random_seed)
         sampled = enforce_pair_type_balance(sampled)
         split_tables.append(sampled)
 
@@ -181,7 +236,8 @@ def create_final_patch_selection(
     final = pd.concat(split_tables, ignore_index=True)
     final = final.drop_duplicates(subset=["patch_id"]).copy()
     final["final_selected"] = True
-    return final.reset_index(drop=True)
+    final = final.sample(frac=1.0, random_state=random_seed).reset_index(drop=True)
+    return final
 
 
 def create_selection_reports(
@@ -201,7 +257,11 @@ def create_selection_reports(
         "pair_distribution": report_dir / "final_pair_distribution.csv",
         "timegap_distribution": report_dir / "final_timegap_distribution.csv",
         "removed_summary": report_dir / "final_removed_patch_summary.csv",
+        "true_success_label_distribution": report_dir / "true_success_label_distribution.csv",
     }
+    summarize_success_label_filter(original_df).to_csv(
+        paths["true_success_label_distribution"], index=False, encoding="utf-8"
+    )
     _original_vs_final_summary(valid_original, final_df).to_csv(
         paths["summary"], index=False, encoding="utf-8"
     )
@@ -241,6 +301,66 @@ def _spatial_sample_group(
     return sorted_group.iloc[positions.tolist()].copy()
 
 
+def _select_class_with_pair_cap(
+    split_df: pd.DataFrame,
+    change_class: str,
+    split_name: str,
+    max_patches_per_pair: int,
+    random_seed: int,
+) -> pd.DataFrame:
+    """Select one change class using its class-specific pair cap."""
+    class_df = split_df[split_df["change_class"] == change_class].copy()
+    if class_df.empty:
+        return class_df
+
+    selected = []
+    if "pair_id" not in class_df:
+        selected = [class_df]
+    else:
+        for pair_id, group in class_df.groupby("pair_id", sort=False):
+            if len(group) <= max_patches_per_pair:
+                sampled = group.copy()
+            else:
+                sampled = _spatial_sample_group(
+                    group,
+                    max_patches=max_patches_per_pair,
+                    random_seed=_stable_seed(f"{split_name}_{change_class}_{pair_id}", random_seed),
+                )
+            selected.append(sampled)
+
+    output = pd.concat(selected, ignore_index=True) if selected else class_df.iloc[0:0].copy()
+    output["selection_stage"] = f"{change_class}_pair_cap_{max_patches_per_pair}"
+    output["class_sampling_weight"] = len(output) / max(1, len(class_df))
+    return output
+
+
+def _enforce_high_district_soft_cap(
+    high_df: pd.DataFrame,
+    split_name: str,
+    target_count: int,
+    random_seed: int,
+) -> pd.DataFrame:
+    """Softly prevent one district from dominating high-change samples."""
+    if high_df.empty or "district" not in high_df or target_count <= 0:
+        return high_df.iloc[0:0].copy() if target_count <= 0 else high_df.copy()
+
+    district_cap = max(300, int(round(target_count * 0.08)))
+    selected = []
+    for district, group in high_df.groupby("district", sort=False):
+        if len(group) <= district_cap:
+            selected.append(group)
+        else:
+            sampled = _spatial_sample_group(
+                group,
+                max_patches=district_cap,
+                random_seed=_stable_seed(f"{split_name}_high_{district}", random_seed),
+            )
+            selected.append(sampled)
+    output = pd.concat(selected, ignore_index=True) if selected else high_df.iloc[0:0].copy()
+    output["selection_stage"] = output["selection_stage"].astype(str) + "|high_district_soft_cap"
+    return output
+
+
 def _original_vs_final_summary(original: pd.DataFrame, final: pd.DataFrame) -> pd.DataFrame:
     """Create high-level original vs final summary rows."""
     pair_counts = final.groupby("pair_id").size() if not final.empty else pd.Series(dtype=int)
@@ -274,6 +394,9 @@ def _removed_summary(original: pd.DataFrame, final: pd.DataFrame, removed: pd.Da
         {"summary_type": "metric", "value": "removed_count", "count": len(removed)},
     ]
     rows.extend(_top_removed_rows(removed, "district", "top_removed_district"))
+    rows.extend(_top_removed_rows(removed, "change_class", "removed_change_class"))
+    rows.extend(_top_removed_rows(removed, "pair_type", "removed_pair_type"))
+    rows.extend(_top_removed_rows(removed, "time_gap_group", "removed_time_gap_group"))
     rows.extend(_top_removed_rows(removed, "pair_id", "top_removed_pair_id"))
     return pd.DataFrame(rows)
 

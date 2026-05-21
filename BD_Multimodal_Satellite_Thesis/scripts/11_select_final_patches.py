@@ -14,6 +14,7 @@ from src.patches.select_final_patches import (  # noqa: E402
     create_final_patch_selection,
     create_selection_reports,
     load_valid_labeled_patches,
+    summarize_success_label_filter,
 )
 from src.utils.file_utils import ensure_dir  # noqa: E402
 
@@ -45,11 +46,13 @@ def main() -> None:
 
     labeled = pd.read_parquet(labeled_path)
     valid = load_valid_labeled_patches(labeled)
+    print_true_success_label_report(labeled, valid)
     final = create_final_patch_selection(
         labeled,
         split_targets=SPLIT_TARGETS,
         random_seed=RANDOM_SEED,
     )
+    validate_final_selection(final)
 
     final.to_parquet(final_dir / "final_patch_dataset.parquet", index=False)
     for split in ["train", "val", "test"]:
@@ -65,6 +68,11 @@ def main() -> None:
 def print_final_selection_report(valid: pd.DataFrame, final: pd.DataFrame) -> None:
     """Print the requested final patch selection summary."""
     pair_counts = final.groupby("pair_id").size() if not final.empty else pd.Series(dtype=int)
+    class_pair_counts = (
+        final.groupby(["change_class", "pair_id"]).size()
+        if not final.empty
+        else pd.Series(dtype=int)
+    )
     print(f"Original valid patch count: {len(valid)}")
     print(f"Final selected patch count: {len(final)}")
     print("Selected count by split:")
@@ -78,6 +86,12 @@ def print_final_selection_report(valid: pd.DataFrame, final: pd.DataFrame) -> No
     print("Selected count by district top 20:")
     _print_counts(final, "district", top_n=20)
     print(f"Max patches per pair after balancing: {0 if pair_counts.empty else int(pair_counts.max())}")
+    print("Max patches per pair by change_class:")
+    if class_pair_counts.empty:
+        print("  none")
+    else:
+        for change_class, max_count in class_pair_counts.groupby(level=0).max().sort_index().items():
+            print(f"  {change_class}: {int(max_count)}")
     print(
         "Mean patches per pair after balancing: "
         f"{0.0 if pair_counts.empty else pair_counts.mean():.4f}"
@@ -103,6 +117,38 @@ def _print_counts(df: pd.DataFrame, column: str, top_n: int | None = None) -> No
         return
     for value, count in counts.items():
         print(f"  {value}: {int(count)}")
+
+
+def print_true_success_label_report(labeled: pd.DataFrame, valid: pd.DataFrame) -> None:
+    """Print the true success-only label distribution before selection."""
+    print("True success label filter report:")
+    for _, row in summarize_success_label_filter(labeled).iterrows():
+        print(f"  {row['metric']}: {int(row['value'])}")
+    print("True successful class distribution:")
+    _print_counts(valid, "change_class")
+
+
+def validate_final_selection(final: pd.DataFrame) -> None:
+    """Validate required final-selection integrity constraints."""
+    duplicate_count = int(final["patch_id"].duplicated().sum()) if "patch_id" in final else 0
+    invalid_status = int((final["label_status"] != "success").sum()) if "label_status" in final else len(final)
+    invalid_class = int((~final["change_class"].isin({"low", "medium", "high"})).sum())
+    nan_ratio = int(final["change_ratio"].isna().sum())
+
+    print("Integrity checks:")
+    print(f"  duplicate patch_id count: {duplicate_count}")
+    print(f"  non-success label_status count: {invalid_status}")
+    print(f"  invalid change_class count: {invalid_class}")
+    print(f"  NaN change_ratio count: {nan_ratio}")
+
+    if duplicate_count:
+        raise ValueError(f"Final selection contains duplicate patch_id rows: {duplicate_count}")
+    if invalid_status:
+        raise ValueError(f"Final selection contains non-success labels: {invalid_status}")
+    if invalid_class:
+        raise ValueError(f"Final selection contains invalid change_class rows: {invalid_class}")
+    if nan_ratio:
+        raise ValueError(f"Final selection contains NaN change_ratio rows: {nan_ratio}")
 
 
 def _print_patch_examples(df: pd.DataFrame) -> None:
