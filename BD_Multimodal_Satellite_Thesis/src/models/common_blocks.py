@@ -19,7 +19,7 @@ def _activation_layer(name: str) -> nn.Module:
 
 
 class MLPBlock(nn.Module):
-    """Generic fully connected block with optional batch norm and dropout."""
+    """Generic fully connected block with optional normalization and dropout."""
 
     def __init__(
         self,
@@ -29,8 +29,10 @@ class MLPBlock(nn.Module):
         dropout: float = 0.2,
         activation: str = "gelu",
         use_batchnorm: bool = True,
+        norm_type: str | None = "layernorm",
     ) -> None:
         super().__init__()
+        resolved_norm_type = self._resolve_norm_type(use_batchnorm, norm_type)
         dims = [int(input_dim), *[int(dim) for dim in hidden_dims], int(output_dim)]
         layers: list[nn.Module] = []
         for index in range(len(dims) - 1):
@@ -39,8 +41,9 @@ class MLPBlock(nn.Module):
             is_hidden = index < len(dims) - 2
             layers.append(nn.Linear(in_dim, out_dim))
             if is_hidden:
-                if use_batchnorm:
-                    layers.append(nn.BatchNorm1d(out_dim))
+                norm_layer = self._normalization_layer(out_dim, resolved_norm_type)
+                if norm_layer is not None:
+                    layers.append(norm_layer)
                 layers.append(_activation_layer(activation))
                 if dropout > 0:
                     layers.append(nn.Dropout(dropout))
@@ -49,6 +52,27 @@ class MLPBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Return the MLP output tensor."""
         return self.net(x)
+
+    @staticmethod
+    def _resolve_norm_type(use_batchnorm: bool, norm_type: str | None) -> str:
+        """Resolve legacy use_batchnorm into the new normalization option."""
+        if not use_batchnorm:
+            return "none"
+        if norm_type is None:
+            return "layernorm"
+        normalized = norm_type.lower()
+        if normalized not in {"layernorm", "batchnorm", "none"}:
+            raise ValueError("norm_type must be one of: layernorm, batchnorm, none")
+        return normalized
+
+    @staticmethod
+    def _normalization_layer(dim: int, norm_type: str) -> nn.Module | None:
+        """Create a hidden-layer normalization module."""
+        if norm_type == "layernorm":
+            return nn.LayerNorm(dim)
+        if norm_type == "batchnorm":
+            return nn.BatchNorm1d(dim)
+        return None
 
 
 class TabularEncoder(nn.Module):
@@ -69,6 +93,7 @@ class TabularEncoder(nn.Module):
             dropout=dropout,
             activation="gelu",
             use_batchnorm=True,
+            norm_type="layernorm",
         )
 
     def forward(self, tabular: torch.Tensor) -> torch.Tensor:
@@ -106,6 +131,7 @@ class SiameseFeatureFusion(nn.Module):
             dropout=dropout,
             activation="gelu",
             use_batchnorm=True,
+            norm_type="layernorm",
         )
 
     def forward(
@@ -152,6 +178,7 @@ class RegressionHead(nn.Module):
             dropout=dropout,
             activation="gelu",
             use_batchnorm=True,
+            norm_type="layernorm",
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -177,6 +204,7 @@ class ClassificationHead(nn.Module):
             dropout=dropout,
             activation="gelu",
             use_batchnorm=True,
+            norm_type="layernorm",
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
