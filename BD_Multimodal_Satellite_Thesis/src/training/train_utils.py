@@ -86,6 +86,8 @@ def save_checkpoint(
     epoch: int,
     metrics: dict[str, Any],
     config: dict[str, Any],
+    best_metric: float | None = None,
+    history: list[dict[str, Any]] | None = None,
 ) -> None:
     """Save model, optimizer, scheduler, epoch, metrics, and config."""
     path = Path(path)
@@ -97,6 +99,8 @@ def save_checkpoint(
         "epoch": int(epoch),
         "metrics": metrics,
         "config": config,
+        "best_metric": best_metric,
+        "history": history or [],
     }
     torch.save(checkpoint, path)
 
@@ -109,13 +113,34 @@ def load_checkpoint(
     map_location: str | torch.device = "cpu",
 ) -> dict[str, Any]:
     """Load checkpoint into model and optionally optimizer/scheduler."""
-    checkpoint = torch.load(path, map_location=map_location)
+    device = torch.device(map_location)
+    checkpoint = torch.load(path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer_restored = False
+    scheduler_restored = False
     if optimizer is not None and checkpoint.get("optimizer_state_dict") is not None:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        move_optimizer_state_to_device(optimizer, device)
+        optimizer_restored = True
+    elif optimizer is not None:
+        print(f"Warning: checkpoint {path} has no optimizer_state_dict; optimizer was not restored.")
     if scheduler is not None and checkpoint.get("scheduler_state_dict") is not None:
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        scheduler_restored = True
+    elif scheduler is not None:
+        print(f"Warning: checkpoint {path} has no scheduler_state_dict; scheduler was not restored.")
+    checkpoint["_optimizer_restored"] = optimizer_restored
+    checkpoint["_scheduler_restored"] = scheduler_restored
     return checkpoint
+
+
+def move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: torch.device | str) -> None:
+    """Move optimizer state tensors to the selected device after checkpoint load."""
+    device = torch.device(device)
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor):
+                state[key] = value.to(device)
 
 
 def ensure_dir(path: str | Path) -> Path:

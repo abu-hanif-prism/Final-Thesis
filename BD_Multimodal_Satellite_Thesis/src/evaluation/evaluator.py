@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import numpy as np
-import pandas as pd
 import torch
 
 from src.evaluation.metrics import compute_metrics
@@ -27,6 +27,7 @@ class ModelEvaluator:
         output_mode: str = "regression",
         device: torch.device | str | None = None,
         loss_fn: torch.nn.Module | None = None,
+        progress_every: int = 10,
     ) -> None:
         if output_mode not in {"regression", "classification", "multitask"}:
             raise ValueError("output_mode must be one of: regression, classification, multitask")
@@ -35,52 +36,64 @@ class ModelEvaluator:
         self.output_mode = output_mode
         self.device = torch.device(device) if device is not None else torch.device("cpu")
         self.loss_fn = loss_fn
+        self.progress_every = max(int(progress_every), 0)
         self.model.to(self.device)
-        self._prediction_df: pd.DataFrame | None = None
+        self._predictions: list[dict[str, Any]] | None = None
 
     def evaluate(self) -> dict[str, Any]:
         """Run evaluation and return metrics, optional loss, and predictions."""
-        prediction_df, metric_outputs, metric_batch, average_loss = self._run_inference()
+        predictions, metric_outputs, metric_batch, average_loss = self._run_inference()
         metrics = compute_metrics(metric_outputs, metric_batch, self.output_mode)
-        result: dict[str, Any] = {"metrics": metrics, "predictions": prediction_df}
+        result: dict[str, Any] = {"metrics": metrics, "predictions": predictions}
         if average_loss is not None:
             result["average_loss"] = average_loss
-        self._prediction_df = prediction_df
+        self._predictions = predictions
         return result
 
-    def collect_predictions(self) -> pd.DataFrame:
+    def collect_predictions(self) -> list[dict[str, Any]]:
         """Return one prediction row per sample, running inference if needed."""
-        if self._prediction_df is None:
-            self._prediction_df, _, _, _ = self._run_inference()
-        return self._prediction_df.copy()
+        if self._predictions is None:
+            self._predictions, _, _, _ = self._run_inference()
+        return [dict(row) for row in self._predictions]
 
-    def summarize_by_groups(self, prediction_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    def summarize_by_groups(self, predictions: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
         """Create group-level summaries for common metadata dimensions."""
-        summaries: dict[str, pd.DataFrame] = {}
+        summaries: dict[str, list[dict[str, Any]]] = {}
         for column in ["split", "district", "change_class", "pair_type", "time_gap_group"]:
-            if column not in prediction_df.columns:
+            if not any(column in row for row in predictions):
                 continue
-            rows = []
-            for value, group in prediction_df.groupby(column, dropna=False):
+            groups: dict[Any, list[dict[str, Any]]] = {}
+            for row in predictions:
+                groups.setdefault(row.get(column), []).append(row)
+
+            rows: list[dict[str, Any]] = []
+            for value, group in groups.items():
                 row: dict[str, Any] = {column: value, "count": int(len(group))}
-                if {"abs_error", "squared_error", "y_true_change_ratio", "y_pred_change_ratio"}.issubset(group.columns):
+                if all(
+                    all(key in item for key in ["abs_error", "squared_error", "y_true_change_ratio", "y_pred_change_ratio"])
+                    for item in group
+                ):
+                    abs_errors = [float(item["abs_error"]) for item in group]
+                    squared_errors = [float(item["squared_error"]) for item in group]
+                    true_values = [float(item["y_true_change_ratio"]) for item in group]
+                    pred_values = [float(item["y_pred_change_ratio"]) for item in group]
                     row.update(
                         {
-                            "mae": float(group["abs_error"].mean()),
-                            "rmse": float(np.sqrt(group["squared_error"].mean())),
-                            "mean_true_change_ratio": float(group["y_true_change_ratio"].mean()),
-                            "mean_predicted_change_ratio": float(group["y_pred_change_ratio"].mean()),
+                            "mae": float(np.mean(abs_errors)),
+                            "rmse": float(np.sqrt(np.mean(squared_errors))),
+                            "mean_true_change_ratio": float(np.mean(true_values)),
+                            "mean_predicted_change_ratio": float(np.mean(pred_values)),
                         }
                     )
-                if "correct" in group.columns:
-                    row["accuracy"] = float(group["correct"].mean())
+                if all("correct" in item for item in group):
+                    row["accuracy"] = float(np.mean([bool(item["correct"]) for item in group]))
                 rows.append(row)
-            summaries[column] = pd.DataFrame(rows).sort_values("count", ascending=False).reset_index(drop=True)
+            summaries[column] = sorted(rows, key=lambda item: item.get("count", 0), reverse=True)
         return summaries
 
     def _run_inference(
         self,
-    ) -> tuple[pd.DataFrame, torch.Tensor | dict[str, torch.Tensor], dict[str, torch.Tensor], float | None]:
+    ) -> tuple[list[dict[str, Any]], torch.Tensor | dict[str, torch.Tensor], dict[str, torch.Tensor], float | None]:
         self.model.eval()
         rows: list[dict[str, Any]] = []
         reg_preds: list[torch.Tensor] = []
@@ -89,13 +102,18 @@ class ModelEvaluator:
         cls_targets: list[torch.Tensor] = []
         loss_sum = 0.0
         loss_count = 0
+        processed_samples = 0
+        total_samples = _safe_dataset_len(self.dataloader)
+        total_batches = len(self.dataloader) if hasattr(self.dataloader, "__len__") else None
+        start_time = time.time()
 
         with torch.no_grad():
-            for batch in self.dataloader:
+            for batch_index, batch in enumerate(self.dataloader, start=1):
                 metadata_batch = batch
                 batch = move_batch_to_device(batch, self.device)
                 outputs = self.model(batch["image_t1"], batch["image_t2"], batch["tabular"])
                 batch_size = int(batch["image_t1"].shape[0])
+                processed_samples += batch_size
 
                 if self.loss_fn is not None:
                     loss_dict = compute_loss(outputs, batch, self.output_mode, self.loss_fn)
@@ -114,10 +132,57 @@ class ModelEvaluator:
                     cls_logits.append(logits.detach().cpu())
                     cls_targets.append(batch["change_class_id"].detach().cpu().view(-1))
 
-        prediction_df = pd.DataFrame(rows)
+                if self._should_log_progress(batch_index, total_batches):
+                    self._print_progress(batch_index, processed_samples, total_samples, start_time)
+
         metric_outputs, metric_batch = self._metric_payloads(reg_preds, reg_targets, cls_logits, cls_targets)
         average_loss = loss_sum / loss_count if loss_count else None
-        return prediction_df, metric_outputs, metric_batch, average_loss
+        return rows, metric_outputs, metric_batch, average_loss
+
+    def _should_log_progress(self, batch_index: int, total_batches: int | None) -> bool:
+        """Return whether to print progress after this batch."""
+        if self.progress_every <= 0:
+            return False
+        if batch_index == 1:
+            return True
+        if batch_index % self.progress_every == 0:
+            return True
+        return total_batches is not None and batch_index == total_batches
+
+    def _print_progress(
+        self,
+        batch_index: int,
+        processed_samples: int,
+        total_samples: int | None,
+        start_time: float,
+    ) -> None:
+        """Print live evaluation progress."""
+        elapsed = max(time.time() - start_time, 1e-9)
+        samples_per_sec = processed_samples / elapsed
+        batches_per_sec = batch_index / elapsed
+        if total_samples:
+            percent = min(100.0, processed_samples / total_samples * 100.0)
+            remaining = max(total_samples - processed_samples, 0)
+            eta_seconds = remaining / samples_per_sec if samples_per_sec > 0 else float("inf")
+            total_text = str(total_samples)
+            percent_text = f"{percent:.1f}%"
+            eta_text = _format_seconds(eta_seconds)
+        else:
+            total_text = "unknown"
+            percent_text = "n/a"
+            eta_text = "n/a"
+
+        print(
+            "Evaluation progress: "
+            f"batch={batch_index}, "
+            f"samples={processed_samples}/{total_text}, "
+            f"percent={percent_text}, "
+            f"elapsed={_format_seconds(elapsed)}, "
+            f"eta={eta_text}, "
+            f"speed={samples_per_sec:.1f} samples/s, "
+            f"{batches_per_sec:.2f} batches/s",
+            flush=True,
+        )
 
     def _metric_payloads(
         self,
@@ -190,3 +255,28 @@ def _metadata_value(batch: dict[str, Any], column: str, index: int) -> Any:
     if isinstance(value, (list, tuple)):
         return value[index]
     return value
+
+
+def _safe_dataset_len(dataloader: torch.utils.data.DataLoader) -> int | None:
+    """Return DataLoader dataset length when available."""
+    dataset = getattr(dataloader, "dataset", None)
+    if dataset is None:
+        return None
+    try:
+        return len(dataset)
+    except TypeError:
+        return None
+
+
+def _format_seconds(seconds: float) -> str:
+    """Format seconds as a compact duration."""
+    if not np.isfinite(seconds):
+        return "n/a"
+    seconds_int = int(round(seconds))
+    hours, remainder = divmod(seconds_int, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"

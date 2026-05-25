@@ -19,7 +19,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--experiment_name", default=None)
     parser.add_argument("--checkpoint_path", default=None)
     parser.add_argument("--model_config_path", default=None)
-    parser.add_argument("--index_path", default="data/npz/final_npz_index.parquet")
+    parser.add_argument("--index_path", default="data/npz/final_npz_index.csv")
     parser.add_argument("--split", choices=["train", "val", "test"], default="test")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=0)
@@ -27,6 +27,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", default=None)
     parser.add_argument("--loss", action="store_true")
     parser.add_argument("--save_predictions_parquet", action="store_true")
+    parser.add_argument("--save_parquet", action="store_true")
+    parser.add_argument("--no_parquet_output", action="store_true")
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--progress_every", type=int, default=10)
     parser.add_argument("--image_embedding_dim", type=int, default=256)
     parser.add_argument("--tabular_embedding_dim", type=int, default=128)
     parser.add_argument("--fusion_dim", type=int, default=256)
@@ -44,7 +48,7 @@ def main() -> None:
     """Load model/checkpoint, evaluate split, and export results."""
     try:
         import torch
-        from torch.utils.data import DataLoader
+        from torch.utils.data import DataLoader, Subset
 
         from src.evaluation.evaluator import ModelEvaluator
         from src.models.model_factory import (
@@ -68,13 +72,20 @@ def main() -> None:
     model_config_path = resolve_model_config_path(args, experiment_name)
     output_dir = Path(args.output_dir) if args.output_dir else Path("outputs/evaluation") / experiment_name / args.split
 
+    print(f"checkpoint path: {checkpoint_path}", flush=True)
+    print(f"model config path: {model_config_path}", flush=True)
+    print(f"index path: {args.index_path}", flush=True)
+    print(f"split: {args.split}", flush=True)
+
     if not checkpoint_path.exists():
         print(f"Checkpoint not found: {checkpoint_path}")
         print("Evaluation skipped. Train the model first or pass --checkpoint_path.")
         return
 
     device = torch.device(args.device) if args.device != "auto" else get_device(prefer_gpu=True)
+    print(f"device: {device}", flush=True)
     model, output_mode = create_model_for_evaluation(args, model_name, model_config_path)
+    print("model created", flush=True)
     target_mode = "both" if output_mode == "multitask" else output_mode
 
     try:
@@ -83,19 +94,37 @@ def main() -> None:
         print(f"Evaluation cannot load NPZ dataset: {exc}")
         return
 
+    if args.limit is not None:
+        limit = max(0, min(int(args.limit), len(dataset)))
+        dataset = Subset(dataset, range(limit))
+    print(f"dataset size after optional limit: {len(dataset)}", flush=True)
+    print(f"batch size: {args.batch_size}", flush=True)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    print("dataloader created", flush=True)
     try:
         load_checkpoint(checkpoint_path, model, map_location=device)
+        print("checkpoint loaded", flush=True)
     except Exception as exc:
         print(f"Could not load checkpoint {checkpoint_path}: {exc}")
         return
 
     loss_fn = get_loss_function(output_mode) if args.loss else None
-    evaluator = ModelEvaluator(model, dataloader, output_mode=output_mode, device=device, loss_fn=loss_fn)
+    evaluator = ModelEvaluator(
+        model,
+        dataloader,
+        output_mode=output_mode,
+        device=device,
+        loss_fn=loss_fn,
+        progress_every=args.progress_every,
+    )
+    print("evaluation started", flush=True)
     result = evaluator.evaluate()
-    prediction_df = result["predictions"]
-    group_summaries = evaluator.summarize_by_groups(prediction_df)
-    export_results(output_dir, prediction_df, result["metrics"], group_summaries, args.save_predictions_parquet)
+    print("evaluation finished", flush=True)
+    print("metrics computed", flush=True)
+    predictions = result["predictions"]
+    group_summaries = evaluator.summarize_by_groups(predictions)
+    save_parquet = bool((args.save_predictions_parquet or args.save_parquet) and not args.no_parquet_output)
+    export_results(output_dir, predictions, result["metrics"], group_summaries, save_parquet)
     params = count_parameters(model)
 
     print("Evaluation completed.")
@@ -115,7 +144,7 @@ def main() -> None:
     for key, value in result["metrics"].items():
         print(f"    {key}: {value}")
     print("  first 5 predictions:")
-    print(prediction_df.head(5).to_string(index=False))
+    print(format_prediction_preview(predictions[:5]))
 
 
 def create_model_for_evaluation(args: argparse.Namespace, model_name: str, config_path: Path):
@@ -173,7 +202,7 @@ def resolve_model_config_path(args: argparse.Namespace, experiment_name: str) ->
     return Path("checkpoints") / f"{experiment_name}_model_config.json"
 
 
-def export_results(output_dir: Path, prediction_df, metrics, group_summaries, save_parquet: bool) -> None:
+def export_results(output_dir: Path, predictions, metrics, group_summaries, save_parquet: bool) -> None:
     """Save prediction, metric, summary, and report outputs."""
     from src.evaluation.prediction_export import (
         make_evaluation_report_text,
@@ -183,15 +212,37 @@ def export_results(output_dir: Path, prediction_df, metrics, group_summaries, sa
         save_predictions,
     )
 
+    print("output directory creating", flush=True)
     output_dir.mkdir(parents=True, exist_ok=True)
-    if save_parquet:
-        save_predictions(prediction_df, output_dir / "predictions")
-    else:
-        prediction_df.to_csv(output_dir / "predictions.csv", index=False, encoding="utf-8")
+    print("prediction export started", flush=True)
+    save_predictions(predictions, output_dir / "predictions", save_parquet=save_parquet)
+    print("prediction export finished", flush=True)
+    print("metrics export started", flush=True)
     save_metrics(metrics, output_dir / "metrics")
+    print("metrics export finished", flush=True)
+    print("group summaries export started", flush=True)
     save_group_summaries(group_summaries, output_dir, "group_summary")
+    print("group summaries export finished", flush=True)
     report_text = make_evaluation_report_text(metrics, group_summaries)
     save_evaluation_report(report_text, output_dir / "evaluation_report.txt")
+    print("report export finished", flush=True)
+
+
+def format_prediction_preview(rows: list[dict[str, object]]) -> str:
+    """Format first prediction rows without pandas."""
+    if not rows:
+        return "<no predictions>"
+    fieldnames: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for key in row:
+            if key not in seen:
+                fieldnames.append(key)
+                seen.add(key)
+    lines = [" | ".join(fieldnames)]
+    for row in rows:
+        lines.append(" | ".join(str(row.get(key, "")) for key in fieldnames))
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

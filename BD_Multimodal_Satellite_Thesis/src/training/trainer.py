@@ -34,6 +34,9 @@ class Trainer:
         save_best: bool = True,
         metric_for_best: str = "val_loss",
         lower_is_better: bool = True,
+        start_epoch: int = 1,
+        best_metric: float | None = None,
+        history: list[dict[str, Any]] | None = None,
     ) -> None:
         self.model = model
         self.train_loader = train_loader
@@ -51,8 +54,9 @@ class Trainer:
         self.save_best = save_best
         self.metric_for_best = metric_for_best
         self.lower_is_better = lower_is_better
-        self.best_metric: float | None = None
-        self.history: list[dict[str, Any]] = []
+        self.start_epoch = max(1, int(start_epoch))
+        self.best_metric = best_metric
+        self.history = list(history or [])
         self.model.to(self.device)
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.mixed_precision)
 
@@ -110,8 +114,8 @@ class Trainer:
         return _with_loss_alias(_prefix_metrics(_average_metrics(loss_sums | metric_sums, total_samples), "val"))
 
     def fit(self, num_epochs: int) -> list[dict[str, Any]]:
-        """Train for num_epochs, save checkpoints/history, and return history."""
-        for epoch in range(1, int(num_epochs) + 1):
+        """Train from start_epoch through num_epochs inclusive."""
+        for epoch in range(self.start_epoch, int(num_epochs) + 1):
             train_metrics = self.train_one_epoch(epoch)
             val_metrics = self.validate(epoch)
             epoch_metrics: dict[str, Any] = {"epoch": epoch, **train_metrics, **val_metrics}
@@ -159,12 +163,32 @@ class Trainer:
             "experiment_name": self.experiment_name,
             "metric_for_best": self.metric_for_best,
         }
-        save_checkpoint(latest_path, self.model, self.optimizer, self.scheduler, epoch, metrics, config)
         current_metric = metrics.get(self.metric_for_best)
         if self.save_best and self._is_best(current_metric):
             self.best_metric = float(current_metric)
             best_path = self.checkpoint_dir / f"{self.experiment_name}_best.pt"
-            save_checkpoint(best_path, self.model, self.optimizer, self.scheduler, epoch, metrics, config)
+            save_checkpoint(
+                best_path,
+                self.model,
+                self.optimizer,
+                self.scheduler,
+                epoch,
+                metrics,
+                config,
+                best_metric=self.best_metric,
+                history=self.history,
+            )
+        save_checkpoint(
+            latest_path,
+            self.model,
+            self.optimizer,
+            self.scheduler,
+            epoch,
+            metrics,
+            config,
+            best_metric=self.best_metric,
+            history=self.history,
+        )
 
 
 def _accumulate(target: dict[str, float], values: dict[str, float], weight: int) -> None:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 from pathlib import Path
 import sys
 
@@ -17,7 +19,7 @@ from src.models.model_utils import count_parameters
 from src.training.dataloaders import create_train_val_test_dataloaders
 from src.training.losses import get_loss_function
 from src.training.trainer import Trainer
-from src.training.train_utils import create_optimizer, create_scheduler, get_device, set_random_seed
+from src.training.train_utils import create_optimizer, create_scheduler, get_device, load_checkpoint, set_random_seed
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train any supported multimodal Siamese model.")
     parser.add_argument("--model_name", required=True, choices=["cnn", "swin", "convnext", "maxvit"])
     parser.add_argument("--output_mode", choices=["regression", "classification", "multitask"], default="regression")
-    parser.add_argument("--index_path", default="data/npz/final_npz_index.parquet")
+    parser.add_argument("--index_path", default="data/npz/final_npz_index.csv")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
@@ -56,15 +58,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label_smoothing", type=float, default=0.0)
     parser.add_argument("--regression_weight", type=float, default=1.0)
     parser.add_argument("--classification_weight", type=float, default=1.0)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--resume_checkpoint", default=None)
+    parser.add_argument("--resume_from_latest", action="store_true")
+    parser.add_argument("--restart", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     """Run unified model training."""
     args = parse_args()
+    if args.resume_from_latest:
+        args.resume = True
     set_random_seed(args.seed)
     model_name = normalize_model_name(args.model_name)
     experiment_name = args.experiment_name or build_experiment_name(model_name, args.output_mode)
+    latest_checkpoint_path = Path(args.checkpoint_dir) / f"{experiment_name}_latest.pt"
+    if args.resume and args.restart:
+        print("Use either --resume or --restart, not both.")
+        return
+    if latest_checkpoint_path.exists() and args.restart:
+        print(f"Warning: --restart will overwrite existing checkpoints for {experiment_name}.")
+    if latest_checkpoint_path.exists() and not args.resume and not args.restart:
+        print(f"Existing checkpoint found: {latest_checkpoint_path}")
+        print("Use --resume to continue or --restart to overwrite.")
+        return
+
     device = torch.device(args.device) if args.device != "auto" else get_device(prefer_gpu=True)
     target_mode = "both" if args.output_mode == "multitask" else args.output_mode
     mixed_precision = bool(args.mixed_precision and device.type == "cuda")
@@ -98,7 +117,41 @@ def main() -> None:
     params = count_parameters(model)
     config = build_config(args, model_name, experiment_name, model_kwargs)
     config_path = Path(args.checkpoint_dir) / f"{experiment_name}_model_config.json"
-    save_model_config(config, config_path)
+    save_config_safely(config, config_path, restart=args.restart, resume=args.resume)
+
+    start_epoch = 1
+    best_metric: float | None = None
+    history: list[dict[str, object]] = []
+    if args.resume:
+        resume_checkpoint_path = resolve_resume_checkpoint(args, experiment_name)
+        if not resume_checkpoint_path.exists():
+            print(f"Resume checkpoint not found: {resume_checkpoint_path}")
+            return
+        checkpoint = load_checkpoint(
+            resume_checkpoint_path,
+            model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            map_location=device,
+        )
+        checkpoint_epoch = int(checkpoint.get("epoch", 0))
+        if checkpoint_epoch >= int(args.epochs):
+            print("Checkpoint already reached requested epochs")
+            print(f"  checkpoint epoch: {checkpoint_epoch}")
+            print(f"  requested total epochs: {args.epochs}")
+            return
+        start_epoch = checkpoint_epoch + 1
+        history = load_resume_history(checkpoint, Path(args.log_dir) / f"{experiment_name}_history.csv")
+        best_metric = resolve_best_metric(checkpoint, Path(args.checkpoint_dir) / f"{experiment_name}_best.pt")
+        print_resume_summary(
+            experiment_name=experiment_name,
+            checkpoint_path=resume_checkpoint_path,
+            checkpoint=checkpoint,
+            requested_epochs=args.epochs,
+            next_epoch=start_epoch,
+            best_metric=best_metric,
+            history=history,
+        )
 
     print_training_config(args, model_name, experiment_name, device, train_loader, val_loader, test_loader, params, config_path, mixed_precision)
 
@@ -117,6 +170,9 @@ def main() -> None:
         log_dir=args.log_dir,
         experiment_name=experiment_name,
         metric_for_best="val_loss",
+        start_epoch=start_epoch,
+        best_metric=best_metric,
+        history=history,
     )
     trainer.fit(args.epochs)
 
@@ -156,6 +212,89 @@ def build_loss_kwargs(args: argparse.Namespace) -> dict[str, object]:
 def build_experiment_name(model_name: str, output_mode: str) -> str:
     """Create default experiment name."""
     return f"{model_name}_{output_mode}"
+
+
+def resolve_resume_checkpoint(args: argparse.Namespace, experiment_name: str) -> Path:
+    """Resolve checkpoint path for resume mode."""
+    if args.resume_checkpoint:
+        return Path(args.resume_checkpoint)
+    return Path(args.checkpoint_dir) / f"{experiment_name}_latest.pt"
+
+
+def save_config_safely(config: dict[str, object], config_path: Path, restart: bool, resume: bool) -> None:
+    """Save config without overwriting a different resume config."""
+    if restart or not config_path.exists():
+        save_model_config(config, config_path)
+        return
+    try:
+        with config_path.open("r", encoding="utf-8") as file:
+            existing_config = json.load(file)
+    except Exception as exc:
+        print(f"Warning: could not read existing model config {config_path}: {exc}")
+        if resume:
+            print(f"Keeping existing model config path: {config_path}")
+        return
+    if existing_config == config:
+        print(f"Existing model config is identical: {config_path}")
+        return
+    if resume:
+        print(f"Loaded existing model config path: {config_path}")
+        print("Existing model config differs from current CLI config; not overwriting during resume.")
+        return
+    print(f"Existing model config differs and was not overwritten: {config_path}")
+
+
+def load_resume_history(checkpoint: dict[str, object], history_path: Path) -> list[dict[str, object]]:
+    """Load old history from checkpoint or existing history CSV."""
+    checkpoint_history = checkpoint.get("history")
+    if isinstance(checkpoint_history, list) and checkpoint_history:
+        return [dict(row) for row in checkpoint_history if isinstance(row, dict)]
+    if not history_path.exists():
+        return []
+    with history_path.open("r", newline="", encoding="utf-8") as file:
+        return [dict(row) for row in csv.DictReader(file)]
+
+
+def resolve_best_metric(checkpoint: dict[str, object], best_checkpoint_path: Path) -> float | None:
+    """Resolve best metric from checkpoint fields, best checkpoint, or latest metrics."""
+    if checkpoint.get("best_metric") is not None:
+        return float(checkpoint["best_metric"])
+    if best_checkpoint_path.exists():
+        try:
+            best_checkpoint = torch.load(best_checkpoint_path, map_location="cpu")
+            if best_checkpoint.get("best_metric") is not None:
+                return float(best_checkpoint["best_metric"])
+            metrics = best_checkpoint.get("metrics", {})
+            if isinstance(metrics, dict) and metrics.get("val_loss") is not None:
+                return float(metrics["val_loss"])
+        except Exception as exc:
+            print(f"Warning: could not inspect best checkpoint {best_checkpoint_path}: {exc}")
+    metrics = checkpoint.get("metrics", {})
+    if isinstance(metrics, dict) and metrics.get("val_loss") is not None:
+        return float(metrics["val_loss"])
+    return None
+
+
+def print_resume_summary(
+    experiment_name: str,
+    checkpoint_path: Path,
+    checkpoint: dict[str, object],
+    requested_epochs: int,
+    next_epoch: int,
+    best_metric: float | None,
+    history: list[dict[str, object]],
+) -> None:
+    """Print resume state clearly."""
+    print("Resume training configuration:")
+    print(f"  experiment_name: {experiment_name}")
+    print(f"  checkpoint path loaded: {checkpoint_path}")
+    print(f"  checkpoint epoch: {checkpoint.get('epoch')}")
+    print(f"  requested total epochs: {requested_epochs}")
+    print(f"  next epoch: {next_epoch}")
+    print(f"  best metric so far: {best_metric}")
+    print(f"  history length: {len(history)}")
+    print(f"  optimizer restored: {bool(checkpoint.get('_optimizer_restored'))}")
+    print(f"  scheduler restored: {bool(checkpoint.get('_scheduler_restored'))}")
 
 
 def build_config(

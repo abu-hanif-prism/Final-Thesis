@@ -17,7 +17,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Smoke train any supported model.")
     parser.add_argument("--model_name", default="cnn")
     parser.add_argument("--output_mode", choices=["regression", "classification", "multitask"], default="regression")
-    parser.add_argument("--index_path", default="data/npz/final_npz_index.parquet")
+    parser.add_argument("--index_path", default="data/npz/final_npz_index.csv")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=0)
@@ -38,6 +38,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window_size", type=int, default=8)
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--single_batch_only", action="store_true")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--resume_checkpoint", default=None)
+    parser.add_argument("--restart", action="store_true")
     return parser.parse_args()
 
 
@@ -70,6 +73,7 @@ def run_main() -> None:
             create_optimizer,
             create_scheduler,
             get_device,
+            load_checkpoint,
             move_batch_to_device,
             set_random_seed,
         )
@@ -119,6 +123,33 @@ def run_main() -> None:
     optimizer = create_optimizer(model, learning_rate=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = create_scheduler(optimizer, scheduler_type="plateau")
     params = count_parameters(model)
+    start_epoch = 1
+    best_metric = None
+    history = []
+    if args.resume:
+        resume_path = Path(args.resume_checkpoint) if args.resume_checkpoint else Path(args.checkpoint_dir) / f"{experiment_name}_latest.pt"
+        if not resume_path.exists():
+            print(f"Resume checkpoint not found: {resume_path}")
+            return
+        checkpoint = load_checkpoint(resume_path, model, optimizer=optimizer, scheduler=scheduler, map_location=device)
+        checkpoint_epoch = int(checkpoint.get("epoch", 0))
+        if checkpoint_epoch >= int(args.epochs):
+            print("Checkpoint already reached requested epochs")
+            print(f"  checkpoint epoch: {checkpoint_epoch}")
+            print(f"  requested total epochs: {args.epochs}")
+            return
+        start_epoch = checkpoint_epoch + 1
+        best_metric = checkpoint.get("best_metric")
+        history = checkpoint.get("history") if isinstance(checkpoint.get("history"), list) else []
+        print("Smoke resume configuration:")
+        print(f"  checkpoint path loaded: {resume_path}")
+        print(f"  checkpoint epoch: {checkpoint_epoch}")
+        print(f"  requested total epochs: {args.epochs}")
+        print(f"  next epoch: {start_epoch}")
+        print(f"  best metric so far: {best_metric}")
+        print(f"  history length: {len(history)}")
+        print(f"  optimizer restored: {bool(checkpoint.get('_optimizer_restored'))}")
+        print(f"  scheduler restored: {bool(checkpoint.get('_scheduler_restored'))}")
 
     print("Unified smoke training configuration:")
     print(f"  model_name: {model_name}")
@@ -164,6 +195,9 @@ def run_main() -> None:
         log_dir=args.log_dir,
         experiment_name=experiment_name,
         metric_for_best="val_loss",
+        start_epoch=start_epoch,
+        best_metric=best_metric,
+        history=history,
     )
     debug_print(args.debug, "12. starting fit")
     history = trainer.fit(args.epochs)
