@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import math
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,9 @@ class Trainer:
         start_epoch: int = 1,
         best_metric: float | None = None,
         history: list[dict[str, Any]] | None = None,
+        early_stopping_patience: int = 0,
+        early_stopping_metric: str = "val_total_loss",
+        early_stopping_mode: str = "min",
     ) -> None:
         self.model = model
         self.train_loader = train_loader
@@ -47,7 +51,7 @@ class Trainer:
         self.scheduler = scheduler
         self.device = torch.device(device) if device is not None else torch.device("cpu")
         self.mixed_precision = bool(mixed_precision and self.device.type == "cuda")
-        self.grad_clip_norm = grad_clip_norm
+        self.grad_clip_norm = float(grad_clip_norm) if grad_clip_norm is not None and float(grad_clip_norm) > 0 else None
         self.checkpoint_dir = ensure_dir(checkpoint_dir)
         self.log_dir = ensure_dir(log_dir)
         self.experiment_name = experiment_name
@@ -57,6 +61,13 @@ class Trainer:
         self.start_epoch = max(1, int(start_epoch))
         self.best_metric = best_metric
         self.history = list(history or [])
+        self.early_stopping_patience = max(0, int(early_stopping_patience))
+        self.early_stopping_metric = early_stopping_metric
+        if early_stopping_mode not in {"min", "max"}:
+            raise ValueError("early_stopping_mode must be one of: min, max")
+        self.early_stopping_mode = early_stopping_mode
+        self._early_stopping_best: float | None = None
+        self._early_stopping_bad_epochs = 0
         self.model.to(self.device)
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.mixed_precision)
 
@@ -116,14 +127,30 @@ class Trainer:
     def fit(self, num_epochs: int) -> list[dict[str, Any]]:
         """Train from start_epoch through num_epochs inclusive."""
         for epoch in range(self.start_epoch, int(num_epochs) + 1):
-            train_metrics = self.train_one_epoch(epoch)
-            val_metrics = self.validate(epoch)
-            epoch_metrics: dict[str, Any] = {"epoch": epoch, **train_metrics, **val_metrics}
-            self.history.append(epoch_metrics)
-            self._step_scheduler(epoch_metrics)
-            self._save_epoch_checkpoints(epoch, epoch_metrics)
-            self.save_history()
-            print(_format_epoch_summary(epoch_metrics))
+            try:
+                train_metrics = self.train_one_epoch(epoch)
+                val_metrics = self.validate(epoch)
+                if not val_metrics:
+                    print(f"Warning: validation returned no metrics at epoch {epoch}.")
+                epoch_metrics: dict[str, Any] = {"epoch": epoch, **train_metrics, **val_metrics}
+                self._warn_missing_epoch_metrics(epoch_metrics)
+                self.history.append(epoch_metrics)
+                self._step_scheduler(epoch_metrics)
+                self._save_epoch_checkpoints(epoch, epoch_metrics)
+                self.save_history()
+                print(_format_epoch_summary(epoch_metrics))
+                if self._should_stop_early(epoch_metrics, epoch):
+                    break
+            except Exception as exc:
+                print(f"Error during epoch {epoch}: {exc}")
+                emergency_metrics: dict[str, Any] = {"epoch": epoch, "error": str(exc)}
+                try:
+                    self._save_epoch_checkpoints(epoch, emergency_metrics)
+                    self.save_history()
+                    print(f"Saved latest checkpoint after failure at epoch {epoch}.")
+                except Exception as checkpoint_exc:
+                    print(f"Warning: failed to save checkpoint after epoch failure: {checkpoint_exc}")
+                raise
         return self.history
 
     def save_history(self) -> Path:
@@ -141,6 +168,8 @@ class Trainer:
     def _is_best(self, current_metric: float | None) -> bool:
         """Return True if current metric improves over best metric."""
         if current_metric is None:
+            return False
+        if not math.isfinite(float(current_metric)):
             return False
         if self.best_metric is None:
             return True
@@ -189,6 +218,60 @@ class Trainer:
             best_metric=self.best_metric,
             history=self.history,
         )
+
+    def _warn_missing_epoch_metrics(self, metrics: dict[str, Any]) -> None:
+        """Warn clearly when expected epoch metrics are absent."""
+        required = ["train_total_loss", "val_total_loss"]
+        missing = [key for key in required if key not in metrics]
+        if missing:
+            print(f"Warning: missing expected epoch metrics: {missing}")
+        early_metric = metrics.get(self.early_stopping_metric)
+        if self.early_stopping_patience > 0 and early_metric is None:
+            print(
+                "Warning: early stopping metric "
+                f"{self.early_stopping_metric!r} is missing; early stopping skipped for this epoch."
+            )
+
+    def _should_stop_early(self, metrics: dict[str, Any], epoch: int) -> bool:
+        """Update early stopping state and return True when training should stop."""
+        if self.early_stopping_patience <= 0:
+            return False
+        value = metrics.get(self.early_stopping_metric)
+        if value is None:
+            return False
+        try:
+            value_float = float(value)
+        except (TypeError, ValueError):
+            print(f"Warning: early stopping metric {self.early_stopping_metric!r} is not numeric: {value!r}")
+            return False
+        if not math.isfinite(value_float):
+            print(f"Warning: early stopping metric {self.early_stopping_metric!r} is not finite: {value_float}")
+            self._early_stopping_bad_epochs += 1
+        elif self._is_early_stopping_improvement(value_float):
+            self._early_stopping_best = value_float
+            self._early_stopping_bad_epochs = 0
+        else:
+            self._early_stopping_bad_epochs += 1
+
+        if self._early_stopping_bad_epochs >= self.early_stopping_patience:
+            print(
+                "Early stopping triggered: "
+                f"metric={self.early_stopping_metric}, "
+                f"mode={self.early_stopping_mode}, "
+                f"best={self._early_stopping_best}, "
+                f"patience={self.early_stopping_patience}, "
+                f"epoch={epoch}"
+            )
+            return True
+        return False
+
+    def _is_early_stopping_improvement(self, value: float) -> bool:
+        """Return whether value improves over the early stopping best."""
+        if self._early_stopping_best is None:
+            return True
+        if self.early_stopping_mode == "min":
+            return value < self._early_stopping_best
+        return value > self._early_stopping_best
 
 
 def _accumulate(target: dict[str, float], values: dict[str, float], weight: int) -> None:

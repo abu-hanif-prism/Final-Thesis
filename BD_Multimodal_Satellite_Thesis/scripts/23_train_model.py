@@ -24,7 +24,19 @@ from src.training.train_utils import create_optimizer, create_scheduler, get_dev
 
 def parse_args() -> argparse.Namespace:
     """Parse unified training arguments."""
-    parser = argparse.ArgumentParser(description="Train any supported multimodal Siamese model.")
+    parser = argparse.ArgumentParser(
+        description="Train any supported multimodal Siamese model.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Recommended stable MaxViT command:\n"
+            "python -u scripts/23_train_model.py --index_path data/npz/final_npz_index.csv "
+            "--model_name maxvit --output_mode regression --batch_size 2 --epochs 30 "
+            "--learning_rate 3e-5 --weight_decay 5e-4 --regression_loss_type smooth_l1 "
+            "--huber_delta 0.1 --grad_clip_norm 1.0 --early_stopping_patience 5 "
+            "--num_workers 0 --device cuda --experiment_name maxvit_regression_stable --restart\n"
+            "For MaxViT stability, avoid --mixed_precision unless you have verified it is stable."
+        ),
+    )
     parser.add_argument("--model_name", required=True, choices=["cnn", "swin", "convnext", "maxvit"])
     parser.add_argument("--output_mode", choices=["regression", "classification", "multitask"], default="regression")
     parser.add_argument("--index_path", default="data/npz/final_npz_index.csv")
@@ -62,6 +74,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume_checkpoint", default=None)
     parser.add_argument("--resume_from_latest", action="store_true")
     parser.add_argument("--restart", action="store_true")
+    parser.add_argument("--early_stopping_patience", type=int, default=0)
+    parser.add_argument("--early_stopping_metric", default="val_total_loss")
+    parser.add_argument("--early_stopping_mode", choices=["min", "max"], default="min")
     return parser.parse_args()
 
 
@@ -173,6 +188,9 @@ def main() -> None:
         start_epoch=start_epoch,
         best_metric=best_metric,
         history=history,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_metric=args.early_stopping_metric,
+        early_stopping_mode=args.early_stopping_mode,
     )
     trainer.fit(args.epochs)
 
@@ -316,6 +334,9 @@ def build_config(
         "num_workers": args.num_workers,
         "mixed_precision": args.mixed_precision,
         "grad_clip_norm": args.grad_clip_norm,
+        "early_stopping_patience": args.early_stopping_patience,
+        "early_stopping_metric": args.early_stopping_metric,
+        "early_stopping_mode": args.early_stopping_mode,
         "seed": args.seed,
         "image_embedding_dim": args.image_embedding_dim,
         "tabular_embedding_dim": args.tabular_embedding_dim,
@@ -352,6 +373,13 @@ def print_training_config(
     print(f"  learning_rate: {args.learning_rate}")
     print(f"  weight_decay: {args.weight_decay}")
     print(f"  mixed_precision: {mixed_precision}")
+    print(f"  grad_clip_norm: {args.grad_clip_norm} ({'disabled' if args.grad_clip_norm <= 0 else 'enabled'})")
+    print(
+        "  early_stopping: "
+        f"patience={args.early_stopping_patience}, "
+        f"metric={args.early_stopping_metric}, "
+        f"mode={args.early_stopping_mode}"
+    )
     print(f"  parameters: total={params['total']}, trainable={params['trainable']}")
     print(f"  checkpoint latest: {Path(args.checkpoint_dir) / f'{experiment_name}_latest.pt'}")
     print(f"  checkpoint best: {Path(args.checkpoint_dir) / f'{experiment_name}_best.pt'}")

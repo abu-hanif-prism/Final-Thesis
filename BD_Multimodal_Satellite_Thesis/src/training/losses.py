@@ -70,13 +70,17 @@ class MultiTaskLoss(nn.Module):
         regression_weight: float = 1.0,
         classification_weight: float = 1.0,
         regression_loss_type: str = "mse",
+        huber_delta: float = 0.1,
         class_weights: torch.Tensor | list[float] | tuple[float, ...] | None = None,
         label_smoothing: float = 0.0,
     ) -> None:
         super().__init__()
         self.regression_weight = float(regression_weight)
         self.classification_weight = float(classification_weight)
-        self.regression_loss = RegressionLoss(loss_type=regression_loss_type)
+        self.regression_loss = RegressionLoss(
+            loss_type=regression_loss_type,
+            huber_delta=huber_delta,
+        )
         self.classification_loss = ClassificationLoss(
             class_weights=class_weights,
             label_smoothing=label_smoothing,
@@ -120,6 +124,7 @@ def get_loss_function(output_mode: str, **kwargs: Any) -> nn.Module:
             regression_weight=kwargs.get("regression_weight", 1.0),
             classification_weight=kwargs.get("classification_weight", 1.0),
             regression_loss_type=kwargs.get("regression_loss_type", "mse"),
+            huber_delta=kwargs.get("huber_delta", 0.1),
             class_weights=kwargs.get("class_weights"),
             label_smoothing=kwargs.get("label_smoothing", 0.0),
         )
