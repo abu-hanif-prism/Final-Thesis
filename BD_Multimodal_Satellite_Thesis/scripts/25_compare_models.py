@@ -21,7 +21,12 @@ from src.evaluation.model_comparison import (  # noqa: E402
 )
 
 
-DEFAULT_EXPERIMENTS = ["cnn_regression", "swin_regression", "convnext_regression", "maxvit_regression"]
+DEFAULT_EXPERIMENTS = [
+    "cnn_regression",
+    "swin_regression",
+    "convnext_regression",
+    "maxvit_regression_stable",
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -29,7 +34,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare evaluated model outputs.")
     parser.add_argument("--evaluation_root", default="outputs/evaluation")
     parser.add_argument("--split", default="test")
-    parser.add_argument("--experiments", nargs="+", default=DEFAULT_EXPERIMENTS)
+    parser.add_argument(
+        "--experiments",
+        nargs="+",
+        default=DEFAULT_EXPERIMENTS,
+        help=(
+            "Experiments to compare. Accepts either comma-separated or "
+            "space-separated values."
+        ),
+    )
     parser.add_argument("--primary_metric", default="rmse")
     parser.add_argument(
         "--lower_is_better",
@@ -44,6 +57,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     """Run comparison and save reports."""
     args = parse_args()
+    args.experiments = normalize_experiments(args.experiments)
     metrics_df, prediction_paths_df = collect_model_results(
         args.experiments,
         evaluation_root=args.evaluation_root,
@@ -76,6 +90,7 @@ def save_outputs(
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics_df.to_csv(output_dir / "model_comparison_metrics.csv", index=False)
     ranked_df.to_csv(output_dir / "model_ranking.csv", index=False)
+    ranked_df.to_csv(output_dir / "model_comparison_ranked.csv", index=False)
     output_names = {
         "overall_error_comparison": "overall_error_comparison.csv",
         "by_change_class": "error_by_change_class.csv",
@@ -115,6 +130,21 @@ def print_console_summary(
     else:
         print("  best model: unavailable")
     print(f"  output folder: {args.output_dir}")
+
+
+def normalize_experiments(experiments: list[str] | str) -> list[str]:
+    """Normalize comma-separated or space-separated experiment arguments."""
+    if isinstance(experiments, str):
+        raw_values = [experiments]
+    else:
+        raw_values = experiments
+    normalized: list[str] = []
+    for value in raw_values:
+        for part in str(value).split(","):
+            experiment = part.strip()
+            if experiment:
+                normalized.append(experiment)
+    return normalized
 
 
 if __name__ == "__main__":
